@@ -204,6 +204,38 @@
             useEffect(() => { localStorage.setItem(key, JSON.stringify(value)); }, [key, value]);
             return [value, setValue];
         };
+        // ---- Backup & sync: all progress except the Gemini key, as one JSON file.
+        const BACKUP_EXCLUDE = ['crucible_gemini_key'];
+        const backupKeys = () => Object.keys(localStorage).filter(k => k.startsWith('crucible_') && !BACKUP_EXCLUDE.includes(k));
+        const snapshot = () => Object.fromEntries(backupKeys().map(k => [k, localStorage.getItem(k)]));
+        const summarizeBackup = (data) => {
+            const get = (k) => { try { return JSON.parse(data[k]); } catch { return undefined; } };
+            return `Level ${getLevelInfo(get('crucible_xp') || 0).level} · ${get('crucible_credits') ?? 100} CR · ${get('crucible_streak') ?? 0}-day streak`;
+        };
+        const exportProgress = async () => {
+            const name = `crucible-backup-${getISTISODate()}.json`;
+            const file = new File([JSON.stringify({ app: 'the-crucible', version: 1, exportedAt: new Date().toISOString(), data: snapshot() })], name, { type: 'application/json' });
+            // Phones: share sheet (WhatsApp, Drive, email...). Desktop: plain download.
+            if (matchMedia('(pointer: coarse)').matches && navigator.canShare?.({ files: [file] })) {
+                try { await navigator.share({ files: [file], title: 'The Crucible backup' }); return 'shared'; }
+                catch (e) { if (e.name === 'AbortError') return 'cancelled'; }
+            }
+            const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(file), download: name });
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+            return 'downloaded';
+        };
+        const readBackup = async (file) => {
+            const backup = JSON.parse(await file.text());
+            if (backup?.app !== 'the-crucible' || typeof backup.data !== 'object') throw new Error("that's not a Crucible backup file");
+            return backup;
+        };
+        const applyBackup = (backup) => {
+            backupKeys().forEach(k => localStorage.removeItem(k));
+            Object.entries(backup.data).forEach(([k, v]) => { if (k.startsWith('crucible_') && !BACKUP_EXCLUDE.includes(k)) localStorage.setItem(k, v); });
+            location.reload();  // reload before React writes its old state back
+        };
+
         const historyFromLogbook = () => Object.fromEntries(loadJSON('crucible_logbook', []).map(e => [
             displayToISO(e.date), { done: e.tasks.filter(t => t.completed).length, total: e.tasks.length, perfect: !!e.success }
         ]).filter(([iso]) => iso));
@@ -580,7 +612,7 @@
 
         function ProgressView({
             xp, prestige, onAscend, categoryXp, rank, rankCtx, failStreak, streak, bestStreak, freezes, credits,
-            shieldPrice, onBuyFreeze, hardMode, hardModeNext, onToggleHardMode, perfectWeeks, notifPerm, onEnableReminders, hasKey, onSaveKey
+            shieldPrice, onBuyFreeze, hardMode, hardModeNext, onToggleHardMode, perfectWeeks, notifPerm, onEnableReminders, hasKey, onSaveKey, onExport, onImport
         }) {
             const stats = Object.entries(CATEGORIES).map(([key, cat]) => ({ key, ...cat, info: getLevelInfo(categoryXp[key] || 0, categoryXpToNext) }));
             const next = STREAK_MILESTONES.find(m => m.days > streak);
@@ -712,6 +744,21 @@
                                     <button className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 px-3 py-1.5 rounded text-xs transition-colors">Save</button>
                                 </form>
                                 {hasKey && <button onClick={() => onSaveKey('')} className="text-[10px] font-mono uppercase text-zinc-600 hover:text-red-400 mt-2">Remove key</button>}
+                            </Card>
+
+                            <Card icon="arrow-right-arrow-left" iconClass="text-emerald-400" title="Backup & Sync">
+                                <p className="text-xs text-zinc-500 mb-3 leading-relaxed">
+                                    Move your progress between devices: Export here, send the file to your other device, then Import it there. Importing replaces everything on that device. Your Gemini key is never included.
+                                </p>
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button onClick={onExport} className="bg-emerald-950/50 hover:bg-emerald-900/60 border border-emerald-900/60 text-emerald-300 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider transition-colors">
+                                        <I n="file-export" /> Export
+                                    </button>
+                                    <label className="bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider transition-colors text-center cursor-pointer">
+                                        <I n="file-import" /> Import
+                                        <input type="file" accept="application/json,.json" onChange={onImport} className="hidden" />
+                                    </label>
+                                </div>
                             </Card>
                         </div>
                     </div>
@@ -1123,6 +1170,33 @@
                 pushCelebration({ kicker: 'Ascension', title: `✦ ${prestige + 1}`, subtitle: `Back to Level 1 · +${(prestige + 1) * 10}% XP forever`, color: 'text-fuchsia-400' });
             };
 
+            const onExport = async () => {
+                const result = await exportProgress();
+                if (result === 'shared') showNotification('Backup shared. Import it on your other device.', 'success');
+                if (result === 'downloaded') showNotification('Backup downloaded. Send it to your other device and Import it there.', 'success');
+            };
+
+            const onImport = async (e) => {
+                const file = e.target.files[0];
+                e.target.value = '';  // allow picking the same file again
+                if (!file) return;
+                try {
+                    const backup = await readBackup(file);
+                    const ok = confirm(`Replace ALL progress on this device with this backup?
+
+Backup (${new Date(backup.exportedAt).toLocaleString()}):
+${summarizeBackup(backup.data)}
+
+This device now:
+${summarizeBackup(snapshot())}
+
+This can't be undone. Export this device first if you want to keep it.`);
+                    if (ok) applyBackup(backup);
+                } catch (err) {
+                    showNotification(`Import failed: ${err.message}`, 'error');
+                }
+            };
+
             const enableReminders = async () => {
                 const permission = await Notification.requestPermission().catch(() => 'denied');
                 setNotifPerm(permission);
@@ -1267,7 +1341,8 @@
                                     failStreak={failStreak} streak={streak} bestStreak={bestStreak} freezes={freezes} credits={credits}
                                     shieldPrice={shieldPrice} onBuyFreeze={buyFreeze} hardMode={hardMode} hardModeNext={hardModeNext}
                                     onToggleHardMode={toggleHardMode} perfectWeeks={perfectWeeks} notifPerm={notifPerm} onEnableReminders={enableReminders}
-                                    hasKey={!!geminiKey} onSaveKey={(key) => { setGeminiKey(key); showNotification(key ? 'Gemini key saved on this device.' : 'Gemini key removed. Using the offline task list.', 'success'); }} />
+                                    hasKey={!!geminiKey} onSaveKey={(key) => { setGeminiKey(key); showNotification(key ? 'Gemini key saved on this device.' : 'Gemini key removed. Using the offline task list.', 'success'); }}
+                                    onExport={onExport} onImport={onImport} />
                             )}
                             {activeTab === 'database' && <DatabaseView masterDB={masterDB} setMasterDB={setMasterDB} />}
                             {activeTab === 'logbook' && <LogbookView logbook={logbook} />}
